@@ -1,0 +1,1 @@
+Infra code to create resources to detect faces from streaming videos in realtime
