@@ -2,19 +2,6 @@
   gather_facts: False
   connection: local
   tasks:
-    - name: check rekognition collection
-      command: aws rekognition list-collections --region {{region}}
-      changed_when: False
-      register: list_collections_rsp
-
-    - name: parse response and check if collection is there
-      set_fact:
-        collections: "{{list_collections_rsp.stdout | from_json | json_query('CollectionIds')}}"
-
-    - name: create rekognition collection
-      command: aws rekognition create-collection --collection-id hardhat-detector-POC --region {{region}}
-      when: "'hardhat-detector-POC' not in collections"
-
     - name: check kinesis video stream
       command: aws kinesisvideo list-streams --region {{region}}
       changed_when: False
@@ -25,51 +12,22 @@
         streams: "{{list_streams_rsp.stdout | from_json | json_query('StreamInfoList') | map(attribute='StreamName') | list}}"
 
     - name: create kinesis video stream
-      command: aws kinesisvideo create-stream --stream-name hardhat-detector-POC --data-retention-in-hours 24 --region {{region}}
-      when: "'hardhat-detector-POC' not in streams"
-
-    - name: describe kinesis video stream
-      command: aws kinesisvideo describe-stream --stream-name hardhat-detector-POC  --region {{region}}
-      register: describe_stream_rsp
+      command: aws kinesisvideo create-stream --stream-name {{videoStreamName}} --data-retention-in-hours 24 --region {{region}}
+      when: "projectName not in streams"
 
     - name: create CF stack
       cloudformation:
-        stack_name: hardhat-detector-POC
+        stack_name: "{{projectName}}"
         state: present
         region: "{{region}}"
         template: files/cloudformation-hardhat-detector.yml
+        template_parameters:
+            AppName: "{{projectName}}"
+            StreamNames: "{{videoStreamName}}"
+            TagFilters: '{"key": "face"}, {"key": "hardhat"}, {"key": "helmet"}'
+            SageMakerEndpoint: "{{projectName}}"
+            LambdaFunctionName: "{{lambdaName}}"
+            VpcId: "{{vpcId}}"
+            PublicSubnets: "{{publicSubnets}}"
         tags:
           Project: hardhat-detector-POC
-
-    - cloudformation_info:
-        stack_name: hardhat-detector-POC
-        region: "{{region}}"
-      register: output
-
-    - name: list rekognition stream processors
-      command: aws rekognition list-stream-processors --region us-east-1
-      register: stream_processors_rsp
-
-    - name: get processor names
-      set_fact:
-        stream_processor_names: "{{stream_processors_rsp.stdout | from_json | json_query('StreamProcessors') | map(attribute='Name') | list}}"
-
-    - name: get IAM role arn
-      set_fact:
-        iam_arn: "{{ output['cloudformation']['hardhat-detector-POC']['stack_outputs']['IAMRoleArn'] }}"
-      when: "'hardhat-detector-POC' not in stream_processor_names"
-
-    - name: get kinesis video stream arn
-      set_fact:
-        video_stream_arn: "{{describe_stream_rsp.stdout | from_json | json_query('StreamInfo.StreamARN')}}"
-      when: "'hardhat-detector-POC' not in stream_processor_names"
-
-    - name: create rekognition stream processor
-      command: >
-        aws rekognition create-stream-processor --name hardhat-detector-POC \
-        --input '{"KinesisVideoStream":{"Arn":"{{video_stream_arn}}"}}' \
-        --stream-processor-output '{"KinesisDataStream":{"Arn":"arn:aws:kinesis:{{region}}:223058497773:stream/hardhat-detector-POC"}}' \
-        --role-arn "{{iam_arn}}" \
-        --settings '{"FaceSearch":{"CollectionId":"hardhat-detector-POC","FaceMatchThreshold":85.5}}' \
-        --region {{region}}
-      when: "'hardhat-detector-POC' not in stream_processor_names"

@@ -3,3 +3,8 @@
 
 [aws:vars]
 region=us-east-1
+projectName=hardhat-detector-POC
+lambdaName=hardhat-detector-analyser
+videoStreamName=hardhat-detector-POC
+vpcId=vpc-15f48a6d
+publicSubnets=subnet-55d27a7a

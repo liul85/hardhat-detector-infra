@@ -1,68 +1,268 @@
+---
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "create hardhat-detector resources"
+Description: Create Resources for Kinesis Video Streams + SageMaker integration
 Parameters:
-  DBName:
-    AllowedPattern: "[a-zA-Z][a-zA-Z0-9]*"
-    ConstraintDescription:
-      must begin with a letter and contain only alphanumeric
-      characters.
-    Default: wordpressdb
-    Description: The WordPress database name
-    MaxLength: "64"
-    MinLength: "1"
+  AppName:
     Type: String
+    Description: Unique app name using which all the resources will be created.
+    Default: Hardhat-detector-POC
+  StreamNames:
+    Description: Comma-separated stream names. For example, streamName1, streamName2.
+    Type: String
+  TagFilters:
+    Description: JSON string of Tag filters as per
+      https://docs.aws.amazon.com/resourcegroupstagging/latest/APIReference/API_GetResources.html#resourcegrouptagging-GetResources-request-TagFilters.
+    Type: String
+    Default: '{"key":"kit1","values":["value1","value2"]},{"key":"kit2","values":["value1","value2"]}'
+  SageMakerEndpoint:
+    Type: String
+    Description: SageMaker Endpoint Name for video frame inferencing.
+    MinLength: 1
+  EndPointAcceptContentType:
+    Type: String
+    Description: ContentType that is accepted by Machine Learning Inference Endpoint
+      Please refer to https://docs.aws.amazon.com/sagemaker/latest/dg/algos.html for the ContentType used by SageMaker build-in algorithms.
+    Default: 'image/jpeg'
+  DockerImageRepository:
+    Type: String
+    Default: 528560246458.dkr.ecr.us-east-1.amazonaws.com/kinesisvideosagemakerintegration_release:V1.0.3
+    Description: Docker image for Kinesis Video Stream & SageMaker Integration Driver.
+  LambdaFunctionName:
+    Type: String
+    Default: Hardhat-detector-POC
+    Description: Lambda Function name which consume the data in kinesis stream
+  VpcId:
+    Type: String
+    Description: VPC id
+  PublicSubnets:
+    Type: String
+    Description: public subnet id
+
 Resources:
-  IAMRole:
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: 
+        Ref: AppName
+
+  Kds:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      ShardCount: 1
+
+  EcsTaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: HardHatDetectorRole
-      Description: "IAM Role allow rekognition to have access to kinesis video stream and data stream"
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service: "ecs-tasks.amazonaws.com"
+          Action:
+            - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        -
+          PolicyName: "EcsKvsPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Sid: "PolicyForResources"
+                Effect: "Allow"
+                Action:
+                  - "ssm:GetParameter"
+                  - "dynamodb:*"
+                  - "kinesis:PutRecord"
+                  - "kinesisvideo:Describe*"
+                  - "kinesisvideo:Get*"
+                  - "kinesisvideo:List*"
+                  - "sagemaker:InvokeEndpoint"
+                Resource:
+                  - Fn::Sub: 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+                  - Fn::Sub: 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${DDBTable}'
+                  - Fn::Sub: 'arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/${Kds}'
+                  - Fn::Sub: 'arn:aws:kinesisvideo:${AWS::Region}:${AWS::AccountId}:stream/*'
+                  - Fn::Sub: 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/*'
+              -
+                Sid: "PolicyForActions"
+                Effect: "Allow"
+                Action:
+                  - "tag:GetResources"
+                  - "cloudwatch:PutMetricData"
+                Resource:
+                  - "*"
+
+  KdsLambdaTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: True
+      EventSourceArn:
+        Fn::GetAtt: Kds.Arn
+      FunctionName: 
+        Ref: LambdaFunctionName
+      StartingPosition: "LATEST"
+
+  Params:
+    Type: AWS::SSM::Parameter
+    Properties: 
+      Name:
+        Ref: AppName
+      Description: "Configuration for SageMaker app"
+      Type: String
+      Value: 
+        Fn::Sub: |
+          {"streamNames":[${StreamNames}], "tagFilters":[${TagFilters}],"sageMakerEndpoint":"${SageMakerEndpoint}",
+           "endPointAcceptContentType": "${EndPointAcceptContentType}",
+           "kdsStreamName":"${Kds}","inferenceInterval":6,"sageMakerTaskQueueSize":5000,
+           "sageMakerTaskThreadPoolSize":20,"sageMakerTaskTimeoutInMilli":20000,
+           "sageMakerTaskThreadPoolName":"SageMakerThreadPool-%d"}
+
+  DDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - 
+          AttributeName: "leaseKey"
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "leaseKey"
+          KeyType: "HASH"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName:
+        Ref: AppName
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ResourceId: 
+        Fn::Join: 
+        - /
+        - - service
+          - Ref: Cluster
+          - Fn::GetAtt: SageMakerDriverService.Name
+      ServiceNamespace: ecs
+      ScalableDimension: 'ecs:service:DesiredCount'
+      RoleARN: 
+        Fn::GetAtt: ScalingRole.Arn
+      MaxCapacity: '5'
+      MinCapacity: '1'
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: StepPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: {Ref: ScalableTarget}
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        Cooldown: 300
+        MetricAggregationType: Average
+        StepAdjustments:
+        - {MetricIntervalLowerBound: 0, ScalingAdjustment: 200}
+
+  ECSClusterCPUUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: [Cluster, ScalingPolicy]
+    Properties:
+      AlarmActions:
+      - {Ref: ScalingPolicy}
+      AlarmDescription: Alarm if ECS Cluster CPUUtilization reaches 60%
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+      - Name: ClusterName
+        Value: {Ref: Cluster}
+      - Name: ServiceName
+        Value:
+          Fn::GetAtt: SageMakerDriverService.Name
+      EvaluationPeriods: 5
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Period: 300
+      Statistic: Average
+      Threshold: 60
+
+  ScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
               Service:
-                - rekognition.amazonaws.com
+                - application-autoscaling.amazonaws.com
             Action:
-              - sts:AssumeRole
-      Path: /
-      Policies:
-        - PolicyName: rekognitionPolicy
-          PolicyDocument:
-            Version: 2012-10-17
-            Statement:
-              - Effect: Allow
-                Action:
-                  - kinesis:PutRecord
-                  - kinesis:PutRecords
-                Resource:
-                  - "*"
-              - Effect: Allow
-                Action:
-                  - kinesisvideo:GetDataEndpoint
-                  - kinesisvideo:GetMedia
-                Resource:
-                  - "*"
-              - Effect: Allow
-                Action:
-                  - rekognition:*
-                Resource:
-                  - "*"
-      Tags:
-        - Key: Project
-          Value: hardhat-detector-POC
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
 
-  KinesisStream:
-    Type: AWS::Kinesis::Stream
+  Cluster:
+    Type: AWS::ECS::Cluster
     Properties:
-      Name: hardhat-detector-POC
-      RetentionPeriodHours: 24
-      ShardCount: 1
-      Tags:
-        - Key: Project
-          Value: hardhat-detector-POC
+      ClusterName: 
+        Ref: AppName
+    DependsOn: Params
+    DependsOn: Logs
+    DependsOn: DDBTable
+
+  SageMakerDriverService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: {Ref: Cluster}
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      TaskDefinition: {Ref: SageMakerDriverTaskDefinition}
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: "ENABLED"
+          SecurityGroups:
+            - Ref: NoIngressSecurityGroup
+          Subnets:
+            - Ref: PublicSubnets
+
+  NoIngressSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: "no-ingress-sg"
+      GroupDescription: "Security group with no ingress rule"
+      VpcId: {Ref: VpcId}
+
+  SageMakerDriverTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - "FARGATE"
+      TaskRoleArn:
+        Ref: EcsTaskRole
+      ExecutionRoleArn:
+        Ref: EcsTaskRole
+      ContainerDefinitions:
+        - Name: SageMakerDriver
+          Image: {"Fn::Sub": "${DockerImageRepository}"}
+          DockerLabels:
+            Name: ConsulTemplate
+          Essential: 'true'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: {Ref: AppName}
+              awslogs-region: {Ref: 'AWS::Region'}
+              awslogs-stream-prefix: {"Fn::Sub": "${AppName}-SageMakerDriver"}
+      NetworkMode: "awsvpc"
+      Cpu: 1024
+      Memory: 2048
 
 Outputs:
-  IAMRoleArn:
-    Value: !GetAtt IAMRole.Arn
+  Cluster:
+    Value: {Ref: Cluster}
